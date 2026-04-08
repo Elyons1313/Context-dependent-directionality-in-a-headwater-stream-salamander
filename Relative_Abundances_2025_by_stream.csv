@@ -1,0 +1,4 @@
+Stream,Number Observed,Number Estimated,St. Dev,95% CI Low,95% CI High,Capture Probability
+Zigzag,1322,2076.44,127.87,1869,2377,0.089
+Bear,1728,2038.02,38.86,1969,2120,0.158
+Paradise,1772,2154.94,47.2,2071,2257,0.146

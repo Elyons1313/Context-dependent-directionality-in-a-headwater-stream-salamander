@@ -1,0 +1,2014 @@
+---
+title: "FinalModel2023"
+output: html_document
+date: "2023-10-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+
+## if you are reading this, this is my first time using github - email eric.lyons@umontana.edu with any reproducibility issues 
+
+## I dont use all these packages in this paper - I copy the list of ALL the ones I use in my current projects to save some sanity when swapping projects 
+
+library(tidyverse)
+library(rstan)
+library(RMark)
+library(dplyr)
+library(data.table)
+library(lme4)
+library(ggplot2)
+library(rms)
+library(afex)
+library(AICcmodavg)
+library(performance)
+library(sjPlot)
+library(MuMIn)
+library(ggiraph)
+library(ggiraphExtra)
+library(cowplot)
+library(plotrix)
+library(ggbreak)
+library(ggforce)
+library(gridExtra)
+library(grid)
+```
+
+```{r, include=FALSE}
+#Fixing the Data
+original <-read.csv(file = "2025_Combined_Position_Data.csv")
+original$Stream <- as.factor(original$Stream)
+summary(original$Stream)
+setDT(original)
+colnames(original)[colnames(original) == "ï..FinalID"] <- "FinalID" # not needed anymore, but keeping for future use just in case
+head(original)
+
+abundance <- read.csv("Relative_Abundances_2025.csv") # from the bayesian model - code and results can be found in same repository ADD NAME WHEN PUBLISHED
+
+original <- original %>%
+  filter(Stream == "Bear"|Stream == "Paradise"|Stream == "Zigzag") #removing cascade + canyon (dropped from study after 3 years)
+
+original <- original %>%
+  filter(FinalID != "GP999002018052533") # this particular tag was accidentally reused somehow, removing it from the dataset
+
+
+original <- original %>%
+  filter(Reach != "Inner")
+#^ Remove for Analysis on Inner Reaches
+
+original <- original %>%
+  filter(POL == "X" | POL == "X?"| POL == "LCA")
+#Filter to only salamanders seen alive, not just pinged by telemetry device 
+# X = confirmed alive, X? = resighted, but not recaptured, LCA = later confirmed alive (equivalent to X, used specifically for individuals detected with the telemetry reader in a previous year and confirmed alive in a later year). Technically, the capture probability with the telemetry reader will increase each year as we confirm that unseen individuals were in fact alive, we want to keep track of the rate
+
+
+original$Stream <- as.factor(original$Stream)
+original$Reach <- as.factor(original$Reach)
+original$POL <- as.factor(original$POL)
+original$CorrLongLoc <- as.numeric(original$CorrLongLoc)
+
+for(i in 1:length(original$FinalID)){             # treating metamorphs as larvae - have not yet lost gills
+  if(is.na(original$Stage[i])) {x = FALSE}
+  else if (original$Stage[i] == "M"){
+    original$Stage[i] <- "L"
+  }
+}
+# original$Year <- as.factor(original$Year)
+## Year as a factor is potentially VERY interesting - but HEAVILY dilutes model inference, and is strongly correlated with several of our measured covariates - ended up removing
+
+summary(original)  
+
+```
+
+```{r}
+old <- original %>%
+  filter(OldNew == "O") 
+
+
+new <- original %>%
+  filter(OldNew == "N")
+
+new <- new %>%
+  distinct(FinalID, .keep_all = TRUE)  # removes duplicate "new" tags (they are either recaptures or mislabels, but we can't be sure which it is - removing to be safe)
+
+
+my_data <- old %>% 
+  left_join(new, by = "FinalID")
+
+colnames(my_data)[colnames(my_data) == "OldNew.x"] <- "Old"
+colnames(my_data)[colnames(my_data) == "CorrLongLoc.x"] <- "FinalPosition"
+colnames(my_data)[colnames(my_data) == "CorrLongLoc.y"] <- "InitialPosition"
+colnames(my_data)[colnames(my_data) == "OldNew.y"] <- "New"
+my_data$Distance <- my_data$FinalPosition - my_data$InitialPosition
+my_data$TrueDistance <- abs(my_data$Distance)
+
+
+my_data <- my_data %>% distinct(FinalID, FinalPosition, .keep_all = TRUE) # ignore individuals that were captured in the same spot multiple times (I am not working with capture history here - we only care about where it is in space)
+
+my_data <- my_data[!is.na(my_data$Stage.y), ] # remove individuals with unknown starting life history stage (LHS)
+
+for(i in 1:length(my_data$Stage.x)){ # if LHS not listed for recaptured individuals, assume it hasn't changed
+  if(is.na(my_data$Stage.x[i])){
+    my_data$Stage.x[i] <- my_data$Stage.y[i]
+  }
+}
+
+test <- my_data[order(my_data$FinalID)] ## early testing of dispersal code used for debugging (or comparison of final data frames to model data frames)
+
+
+my_data22 <- my_data  ## creating a duplicate data frame - using this in calculations of absolute (instead of directional) dispersal distance
+
+my_data22$neg_dist <- my_data$Distance ## keeps negatives in dispersal distance 
+
+test$Movement <- NA
+HomeRange <- 4
+
+for (i in 1:length(test$Distance)){         # move further than home range = disperser 
+  if(is.na(test$Distance[i])) {x = FALSE}   # HR variable can be easily changed to look at long distance dispersal only (or if home range estimates change in the future)
+  else if (abs(test$Distance[i]) > HomeRange) {
+    test$Movement[i] <- 1}
+  else if (abs(test$Distance[i]) <= HomeRange) {
+    test$Movement[i] <- 0
+  }
+}
+
+
+
+## Using 4m as the Home Range for this paper
+```
+
+```{r}
+
+### Initial Bin Location - 25m bins (change the [[Xcheck +25]] in loop to desired bin size if needed)
+my_data$IPBin <- NA
+XCheck <- 0
+YCheck <- 1
+repeat{
+
+for(i in 1:length(my_data$InitialPosition)){
+  if(my_data$InitialPosition[i] <= XCheck & is.na(my_data$IPBin[i])){
+    my_data$IPBin[i] <- XCheck-25
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){  ## maximum distance from mainstem = 1500m, using 1600 to catch any typos 
+  break
+}
+}
+
+
+```
+
+```{r}
+
+# Final Bin Location - exact same code as above, but focused on final location 
+my_data$FPBin <- NA
+XCheck <- 0
+YCheck <- 1
+repeat{
+
+for(i in 1:length(my_data$FinalPosition)){
+  if(my_data$FinalPosition[i] <= XCheck & is.na(my_data$FPBin[i])){
+    my_data$FPBin[i] <- XCheck-25
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+```
+
+```{r, include=FALSE}
+
+### FISH DATA - Code needs to be trimmed but works as intended
+fish <- read.csv("HBFish_Data_Combined.csv")
+
+oldfish <- fish %>%
+  filter(Recap..Y.N. == "Y") # yes vs no instead of new vs old
+
+
+newfish <- fish %>%
+  filter(Recap..Y.N. == "N")
+
+
+my_datafish <- oldfish %>% 
+  left_join(newfish, by = "ID")
+
+my_datafish$Distance <- my_datafish$Position.x - my_datafish$Position.y
+
+fishrecap <- subset(my_datafish, abs(my_datafish$Distance) >= 0) # only way to have two distance values is if the individual was recaptured - probably more elegant ways to do this
+fishcaps <- length(unique(fishrecap$ID)) # number of fish
+
+fishdisp <- subset(my_datafish, abs(my_datafish$Distance) > 25) # not used in paper, but this looks at the number of fish that were captured more than one trap away (if you are interested in fish foraging range)
+
+fish <- read.csv("HBFish_Data_Combined.csv") ## resetting the data to look at unique individuals - CMR data is biased 
+
+
+fish <- fish %>%               ## what bins do we fish forage in? same code as salamander bin calcs above
+  group_by(Position) %>%       ## remove fish caught multiple times in the same trap
+  distinct(ID, .keep_all = TRUE)
+
+fish$TrapNumber <- NA
+
+
+XCheck <- 0
+YCheck <- 1
+repeat{
+
+for(i in 1:length(fish$Position)){
+  if(fish$Position[i] <= XCheck & is.na(fish$TrapNumber[i])){
+    fish$TrapNumber[i] <- YCheck
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+
+fish$TrapPosition <- (fish$TrapNumber-1)*25   ## trap number just keeps the Ycheck calculations from taking too long
+
+my_data$FishIndex <- NA    ## add a column in my data - fish index (not filled yet, but just goes with the fish calculations)
+XCheck <- 12.5 ## resets Xcheck and Y check - used to test loop (not removing it in case it breaks something)
+YCheck <- 1
+
+BreakFish <- seq(from = -12.5, to = 1600, by = 25) # sets the breaks for histograms 
+
+# fish <- subset(fish, fish$TrapPosition <= 500)
+
+```
+
+```{r}
+BearFish <- fish %>%          ## ensures that a fish caught in bear only affects salamanders in Bear
+  filter(Stream == "Bear")
+ParFish <- fish %>%
+  filter(Stream == "Paradise")
+ZigFish <- fish %>%
+  filter(Stream == "Zigzag")
+
+fishHist <- hist(fish$TrapPosition, breaks = c(BreakFish), cex.lab = 1.3, 
+                 xlab = "Location", ylab = "# of Fish Caught",
+                 main = "Fish Location")
+
+fishHist ## the following figures were just for my own visualization while I tested code - the code for figures found in the publication is near the bottom
+
+fishHist$breaks   ## confirming breaks lines up with desired trap locations
+
+BearHist <- hist(BearFish$TrapPosition, breaks = c(BreakFish))   ## plot locations of each fish
+BearHist$breaks
+
+ParHist <- hist(ParFish$TrapPosition, breaks = c(BreakFish))
+ParHist$breaks
+
+ZigHist <- hist(ZigFish$TrapPosition, breaks = c(BreakFish))
+ZigHist$breaks
+
+
+FishLevel <- fishHist$counts   ## counts of fish in each bin (overall and in each stream)
+FishLevel
+BearFishLevel <- BearHist$counts
+ParFishLevel <- ParHist$counts
+ZigFishLevel <- ZigHist$counts
+
+# write.csv(BearFishLevel, "BearFish.csv")   
+# write.csv(ParFishLevel, "ParaFish.csv")
+# write.csv(ZigFishLevel, "ZigFish.csv")
+```
+
+```{r}
+XCheck <- 12.5      ## uses the bin loops to assign fish index scores to individual salamanders - how many fish were detected in the closest minnow trap? 
+YCheck <- 1
+
+repeat{
+
+for(i in 1:length(my_data$InitialPosition)){
+  if(my_data$InitialPosition[i] <= XCheck & is.na(my_data$FishIndex[i]) & my_data$Stream.y[i] == "Bear"){
+    my_data$FishIndex[i] <- BearFishLevel[YCheck]
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+XCheck <- 12.5
+YCheck <- 1
+
+repeat{
+
+for(i in 1:length(my_data$InitialPosition)){
+  if(my_data$InitialPosition[i] <= XCheck & is.na(my_data$FishIndex[i]) & my_data$Stream.y[i] == "Paradise"){
+    my_data$FishIndex[i] <- ParFishLevel[YCheck]
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+XCheck <- 12.5
+YCheck <- 1
+
+repeat{
+
+for(i in 1:length(my_data$InitialPosition)){
+  if(my_data$InitialPosition[i] <= XCheck & is.na(my_data$FishIndex[i]) & my_data$Stream.y[i] == "Zigzag"){
+    my_data$FishIndex[i] <- ZigFishLevel[YCheck]
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+```
+
+```{r}
+# extra plots I used to test how the histograms worked - can be ignored
+# one note - the fish level histogram is not intuitive - the first bar is anywhere between zero and one fish per meter 
+
+
+fishHist <- hist(fish$TrapPosition, breaks = c(BreakFish))
+fishHist$breaks
+FishLevel <- fishHist$counts
+FishLevel
+
+bear_check <- subset(my_data, my_data$Stream.x == "Bear")
+hist(bear_check$FishIndex)
+
+
+## treating fish as a binary (were there fish in the area) instead of related to density - might be of use to someone in the future (especially if we get finer scale fish data)
+
+my_data$FishPresent <- NA
+for(i in 1:length(my_data$FishIndex)){
+  if(my_data$FishIndex[i] > 0){
+    my_data$FishPresent[i] <- 1
+  }
+  else my_data$FishPresent[i] <- 0 
+}
+
+my_data$FishIndex <- my_data$FishIndex/25 
+
+ForkLength <- fish$ForkLength[!is.na(fish$ForkLength)]  ## fish size data not used in this paper
+mean(ForkLength)
+```
+
+```{r}
+summary(my_data$Stage.x) 
+
+for(i in 1:length(my_data$Stage.x)){    ## once an individual is an adult, it stays as an adult (cannot transform back into a larvae)
+  if(my_data$Stage.y[i] == "A"){
+    my_data$Stage.x[i] <- "A"
+  }
+}
+summary(my_data$Stage.x)
+
+```
+
+```{r}
+my_data$Movement <- NA   ### same home range code as before, pasted here again so that I did not have to scroll up 300 lines when debugging 
+HomeRange <- 4
+
+for (i in 1:length(my_data$Distance)){
+  if(is.na(my_data$Distance[i])) {x = FALSE}
+  else if (abs(my_data$Distance[i]) >= HomeRange) {
+    my_data$Movement[i] <- 1}
+  else if (abs(my_data$Distance[i]) < HomeRange) {
+    my_data$Movement[i] <- 0
+  }
+}
+```
+
+```{r}
+## another debugging script
+### response to reviewer comment - how many individuals disperse more than once? 
+
+
+test <- my_data[order(my_data$FinalID)]
+
+
+
+test$Movement <- NA
+HomeRange <- 4
+
+for (i in 1:length(test$Distance)){
+  if(is.na(test$Distance[i])) {x = FALSE}
+  else if (abs(test$Distance[i]) > HomeRange) {
+    test$Movement[i] <- 1}
+  else if (abs(test$Distance[i]) <= HomeRange) {
+    test$Movement[i] <- 0
+  }
+}
+
+
+#### I am sure there are better ways to do this, but just kept what worked
+test <- subset(test, test$Movement != 0) ## first grab all the indivdiuals that moved
+
+#give me a list of all the IDs that appear in the movement data more than once (ie caught in at least 3 different places)
+test2 <- test[test$FinalID %in% test$FinalID[duplicated(test$FinalID)],]
+
+#filter to columns I care about
+test3 <- test2[,c(1,3,13,28)]
+
+n_occur <- data.frame(table(test3$FinalID))
+
+doubles <- vector()
+
+## create a new vector - check the ID and position of individuals in sequence 
+## if the difference between sequential captures is more than 4, add individual to doubles dataset
+for(i in 1:length(test3$FinalID)){
+  for(j in 1:length(test3$FinalID)){
+    if((test3$FinalID[j] == test3$FinalID[i]  & abs(test3$FinalPosition[j] - test3$FinalPosition[i] > 4)))
+      doubles <- rbind(doubles, test3$FinalID[i])
+  }
+}
+
+# count number of unique double dispersers 
+doubledip <- unique(doubles)
+
+
+
+# move.means<-aggregate(test$Movement,list(test$FinalID),FUN=mean)
+
+```
+
+```{r}
+# add conspecific densities 
+
+my_data$cdensity <- NA
+
+## match IPbins to density estimates in each bin, again - pulls data from the other model, not calculated here
+
+for(i in 1:length(my_data$FinalID)){
+  for(j in 1:length(abundance$IP)){
+    
+    if(my_data$Stream.x[i] == "Paradise" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$cdensity[i] <- abundance$True_Estimate_Para[j]
+    }
+    else if(my_data$Stream.x[i] == "Bear" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$cdensity[i] <- abundance$True_Estimate_Bear[j]
+    }
+    else if(my_data$Stream.x[i] == "Zigzag" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$cdensity[i] <- abundance$True_Estimate_Zig[j]
+    }
+}
+}
+
+
+## Lower Bound CD estimate
+
+my_data$lowercdensity <- NA
+
+for(i in 1:length(my_data$FinalID)){
+  for(j in 1:length(abundance$IP)){
+    
+    if(my_data$Stream.x[i] == "Paradise" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$lowercdensity[i] <- abundance$LE_Para[j]
+    }
+    else if(my_data$Stream.x[i] == "Bear" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$lowercdensity[i] <- abundance$LE_Bear[j]
+    }
+    else if(my_data$Stream.x[i] == "Zigzag" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$lowercdensity[i] <- abundance$LE_Zig[j]
+    }
+}
+}
+
+
+## UPPER BOUND CD estimate
+
+my_data$uppercdensity <- NA
+
+for(i in 1:length(my_data$FinalID)){
+  for(j in 1:length(abundance$IP)){
+    
+    if(my_data$Stream.x[i] == "Paradise" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$uppercdensity[i] <- abundance$UE_Para[j]
+    }
+    else if(my_data$Stream.x[i] == "Bear" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$uppercdensity[i] <- abundance$UE_Bear[j]
+    }
+    else if(my_data$Stream.x[i] == "Zigzag" & my_data$IPBin[i] == abundance$IP[j]){
+      my_data$uppercdensity[i] <- abundance$UE_Zig[j]
+    }
+}
+}
+```
+
+```{r}
+## Add Water Data
+water <- read.csv("Stream_Data_Winsor.csv") ## wetted width data, measured weekly every 10m
+                                            ## Winsor is my advisor - I use the cleaned up data I send to him in this paper, use that file name in other projects - too late to change it now
+
+my_data$Mean_Wet_Width <- 0
+my_data$Min_Wet_Width <- 0
+
+
+water2 <- water %>%   ## corr_pos = the corrected position (the distance from the mainstem in meters)
+  group_by(Stream, Corr_Pos) %>%
+  dplyr::summarize(Mean_Wet_Width = mean(Wetted_Width, na.rm = TRUE),
+                   Min_Wet_Width = min(Wetted_Width, na.rm = TRUE))
+
+
+my_data$ten_rounded <- round(my_data$InitialPosition/10)*10   ## assign salamanders to the nearest measurement site (eg - closest measurement for all individuals between 35 and 44 meters was at 40m - rounded up )
+my_data$Mean_Wet_Width <- NA
+my_data$Min_Wet_Width <- NA
+
+
+for(i in 1:length(my_data$ten_rounded)){     ### if the stream and capture position match, assign mean and min wetted width values 
+  for(j in 1:length(water2$Corr_Pos)){
+    if(my_data$ten_rounded[i] == water2$Corr_Pos[j] & my_data$Stream.x[i] == water2$Stream[j]){
+      my_data$Mean_Wet_Width[i] <- water2$Mean_Wet_Width[j]
+      my_data$Min_Wet_Width[i] <- water2$Min_Wet_Width[j]
+    }
+  }
+}
+
+
+
+```
+
+```{r}
+#Data was formatted before this
+## change the 4 to a higher value to look at long distance dispersal
+HomeRange <- 4
+
+dispersal <- my_data %>%
+  filter(abs(Distance) > HomeRange)
+
+dispersal <- subset(dispersal, select = -c(Movement))  ## if it dispersed, it had to move
+
+dispersal <- dispersal %>%
+  distinct(FinalID, .keep_all = TRUE)   # remove duplicates - an individual that moves and is caught 3 times at the new location will show up in the data 3 times, but that does not mean we saw 3 different dispersers
+
+for (i in 1:length(dispersal$Distance)){     ### converts the "distance" to a binary for use in logistic regression - one for upsteam movement, zero for downstream
+  if(dispersal$Distance[i] > 0){
+  dispersal$Distance[i] <- 1
+  }
+}
+
+for (i in 1:length(dispersal$Distance)){
+  if(dispersal$Distance[i] < 0){
+  dispersal$Distance[i] <- 0
+  }
+}
+
+para <- subset(my_data, my_data$Stream.x == "Paradise")
+bear <- subset(my_data, my_data$Stream.x == "Bear")
+zig <-  subset(my_data, my_data$Stream.x == "Zigzag")
+
+
+```
+
+# Direction Graph
+
+```{r}
+## first attempt at the graphs - not used in the analysis, but used it to help me debug + see the results
+
+model_full <- glm(Distance~InitialPosition, data = dispersal, family = "binomial"(link=logit))
+
+## points to draw - proportion of upstream dispersers in a given 25m bin
+p_prop <- dispersal %>%
+  group_by(IPBin) %>%
+  dplyr::summarize(prop = mean(Distance))
+
+plot(dispersal$InitialPosition, dispersal$Distance, main = "Directionality", ylab = "Directionality", las = 1)
+
+points(p_prop)
+
+## predict + smooth 
+pred_prop <- predict.glm(model_full, type = c("response"))
+lines(smooth.spline(dispersal$InitialPosition, pred_prop))
+
+summary(model_full)
+```
+
+# Propensity Graph
+
+```{r}
+
+## same thing - debugging + visualizing propensity 
+model_full_2 <- glm(Movement~InitialPosition, data = my_data, family = "binomial"(link=logit))
+
+p_prop_2 <- my_data %>%
+  group_by(IPBin) %>%
+  dplyr::summarize(prop = mean(Movement))
+
+plot(my_data$InitialPosition, my_data$Movement, main = "Propensity", ylab = "Dispersed? (1 = Yes)", las = 1)
+
+points(p_prop_2)
+
+pred_prop_2 <- predict.glm(model_full_2, type = c("response"))
+lines(smooth.spline(my_data$InitialPosition, pred_prop_2))
+
+summary(model_full_2)
+```
+
+## CODING STARTS HERE
+
+```{r}
+
+dd <- datadist(dispersal)
+options(datadist = "dd")   ### I forget why this was needed, but I ran into errors when I removed it, so it stays
+
+my_data <- my_data %>%
+  distinct(FinalID, .keep_all = TRUE)  ## we only care about unique individuals
+
+
+```
+
+# Adults and Larvae Only
+
+## Adults/Larvae Only
+
+```{r}
+## pull adults and larvae from both datasets
+  
+larvae_only <- my_data %>%
+  filter(my_data$Stage.x == "L")
+#NOTE TO SELF- 9 individuals were given NA stage due to inability to confirm- L or M- for publication 9 M become L
+
+summary(dispersal$Stage.x)
+
+adults_only <- my_data %>%
+  filter(my_data$Stage.x == "A")
+
+disp_larvae_only <- dispersal %>%
+  filter(dispersal$Stage.x == "L")
+
+disp_adults_only <- dispersal %>%
+  filter(dispersal$Stage.x == "A")
+
+
+## redoing visualizations for each LHS
+model_2 <- glm(Movement~InitialPosition, data = adults_only, family = "binomial"(link=logit)) 
+
+p_prop <- adults_only %>%
+  group_by(IPBin) %>%
+  dplyr::summarize(prop = mean(Movement))
+
+plot(adults_only$InitialPosition, adults_only$Movement , main = "Propensity", ylab = "Dispersal? (1 = Yes)", las = 1)
+
+points(p_prop)
+
+pred_prop <- predict.glm(model_2, type = c("response"))
+lines(smooth.spline(adults_only$InitialPosition, pred_prop))
+summary(model_2)
+```
+
+```{r}
+
+## now for larvae
+model_3 <- glm(Movement~InitialPosition, data = larvae_only, family = "binomial"(link=logit))
+
+p_prop <- larvae_only %>%
+  group_by(IPBin) %>%
+  dplyr::summarize(prop = mean(Movement))
+
+plot(larvae_only$InitialPosition, larvae_only$Movement , main = "Propensity", ylab = "Dispersal? (1 = Yes)", las = 1)
+
+points(p_prop)
+
+pred_prop <- predict.glm(model_3, type = c("response"))
+lines(smooth.spline(larvae_only$InitialPosition, pred_prop))
+
+summary(model_3)
+```
+
+# Dispersal
+
+```{r}
+
+model_4 <- glm(Distance~InitialPosition, data = disp_adults_only, family = "binomial"(link=logit))
+
+p_prop <- disp_adults_only %>%
+  group_by(IPBin) %>%
+  dplyr::summarize(prop = mean(Distance))
+
+plot(disp_adults_only$InitialPosition, disp_adults_only$Distance , main = "Directionality", ylab = "Directionality", las = 1)
+
+points(p_prop)
+
+pred_prop <- predict.glm(model_4, type = c("response"))
+lines(smooth.spline(disp_adults_only$InitialPosition, pred_prop))
+summary(model_4)
+```
+
+```{r}
+model_5 <- glm(Distance~InitialPosition, data = disp_larvae_only, family = "binomial"(link=logit))
+
+p_prop <- disp_larvae_only %>%
+  group_by(IPBin) %>%
+  dplyr::summarize(prop = mean(Distance))
+
+plot(disp_larvae_only$InitialPosition, disp_larvae_only$Distance, main = "Directionality", ylab = "Directionality", las = 1)
+
+points(p_prop)
+
+pred_prop <- predict.glm(model_5, type = c("response"))
+lines(smooth.spline(disp_larvae_only$InitialPosition, pred_prop))
+
+summary(model_5)
+```
+
+# Scaling Variables
+
+```{r}
+## keeping the unscaled around for later so I can figure out what z = 1.5 means in reality
+
+unscaled_dispersal <- dispersal
+unscaled_my_data <- my_data
+unscaled_adults_only_disp <- disp_adults_only
+unscaled_adults_only <- adults_only
+unscaled_larv_only_disp <- disp_larvae_only
+unscaled_larv_only <- larvae_only
+
+# IP
+dispersal$InitialPosition <- scale(dispersal$InitialPosition)
+my_data$InitialPosition <- scale(my_data$InitialPosition)
+dispersal$TrueDistance <- scale(dispersal$TrueDistance)
+my_data$TrueDistance <- scale(my_data$TrueDistance)
+
+
+adults_only$InitialPosition <- scale(adults_only$InitialPosition)
+disp_adults_only$InitialPosition <- scale(disp_adults_only$InitialPosition)
+larvae_only$InitialPosition <- scale(larvae_only$InitialPosition)
+disp_larvae_only$InitialPosition <- scale(disp_larvae_only$InitialPosition)
+
+
+adults_only$TrueDistance <- scale(adults_only$TrueDistance)
+disp_adults_only$TrueDistance <- scale(disp_adults_only$TrueDistance)
+larvae_only$TrueDistance <- scale(larvae_only$TrueDistance)
+disp_larvae_only$TrueDistance <- scale(disp_larvae_only$TrueDistance)
+
+
+# CD
+dispersal$cdensity <- scale(dispersal$cdensity)
+my_data$cdensity <- scale(my_data$cdensity)
+
+
+adults_only$cdensity <- scale(adults_only$cdensity)
+disp_adults_only$cdensity <- scale(disp_adults_only$cdensity)
+larvae_only$cdensity <- scale(larvae_only$cdensity)
+disp_larvae_only$cdensity <- scale(disp_larvae_only$cdensity)
+
+#### Wetted_Width
+
+dispersal$Mean_Wet_Width <- scale(dispersal$Mean_Wet_Width)
+my_data$Mean_Wet_Width <- scale(my_data$Mean_Wet_Width)
+
+
+adults_only$Mean_Wet_Width <- scale(adults_only$Mean_Wet_Width)
+disp_adults_only$Mean_Wet_Width <- scale(disp_adults_only$Mean_Wet_Width)
+larvae_only$Mean_Wet_Width <- scale(larvae_only$Mean_Wet_Width)
+disp_larvae_only$Mean_Wet_Width <- scale(disp_larvae_only$Mean_Wet_Width)
+
+
+### Min Width
+
+dispersal$Min_Wet_Width <- scale(dispersal$Min_Wet_Width)
+my_data$Min_Wet_Width <- scale(my_data$Min_Wet_Width)
+
+
+adults_only$Min_Wet_Width <- scale(adults_only$Min_Wet_Width)
+disp_adults_only$Min_Wet_Width <- scale(disp_adults_only$Min_Wet_Width)
+larvae_only$Min_Wet_Width <- scale(larvae_only$Min_Wet_Width)
+disp_larvae_only$Min_Wet_Width <- scale(disp_larvae_only$Min_Wet_Width)
+
+
+
+### FISH INDEX
+dispersal$FishIndex <- scale(dispersal$FishIndex)
+my_data$FishIndex <- scale(my_data$FishIndex)
+
+
+adults_only$FishIndex <- scale(adults_only$FishIndex)
+disp_adults_only$FishIndex <- scale(disp_adults_only$FishIndex)
+larvae_only$FishIndex <- scale(larvae_only$FishIndex)
+disp_larvae_only$FishIndex <- scale(disp_larvae_only$FishIndex)
+# 
+
+```
+
+# Running Every Candidate Model
+
+## Adults Direction
+
+```{r}
+
+
+## keep only relevant columns
+disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,31,32)]
+
+options(na.action = "na.fail")
+
+### all models listed in Table S2 (that number might have changed in review)
+### logistic regressions with logit links
+mod1 <- glm(Distance~Stream.x + InitialPosition , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod2 <- glm(Distance~Stream.x + InitialPosition + TrueDistance , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+
+mod3 <- glm(Distance~Stream.x + InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod4 <- glm(Distance~Stream.x + InitialPosition + FishIndex + 
+              cdensity , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+
+mod6 <- glm(Distance~Stream.x + FishIndex , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod7 <- glm(Distance~ FishIndex + Mean_Wet_Width , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod8 <- glm(Distance~TrueDistance , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod9 <- glm(Distance~ cdensity , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod10 <- glm(Distance~ cdensity + Mean_Wet_Width , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod11 <- glm(Distance~ InitialPosition + TrueDistance , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod12 <- glm(Distance~ InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod13 <- glm(Distance~ InitialPosition + FishIndex + 
+              cdensity ,
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod14 <- glm(Distance~ InitialPosition +  cdensity  , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod15 <- glm(Distance~ InitialPosition + FishIndex , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod16 <- glm(Distance~ FishIndex + cdensity , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod17 <- glm(Distance~ InitialPosition , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod18 <- glm(Distance~FishIndex , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod19 <- glm(Distance~ TrueDistance + FishIndex , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod20 <- glm(Distance~ TrueDistance + cdensity , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod21 <- glm(Distance~1, 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+mod22 <- glm(Distance~Stream.x + InitialPosition + TrueDistance + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = disp_adults_only_sub, family = "binomial"(link=logit))
+
+## list of models
+mods<- as.list(paste("mod", seq(1,22), sep=""))
+
+## manually pasted all the models. Because c(mods) did not work and this is quicker than trying to figure out why
+results <- model.sel(mod1,mod2,mod3,mod4,mod6,mod7,mod8,mod9,mod10,mod11,mod12,
+          mod13,mod14,mod15,mod16,mod17,mod18,mod19,mod20,mod21,mod22)
+
+
+sw(results)
+
+## get only the mods with within AIC < 2 
+topmods <- subset(results, delta <2)
+
+```
+
+```{r}
+
+## average effect sizes across models
+adultdirectionresults <- model.avg(topmods)
+
+
+summary(adultdirectionresults)
+confint(adultdirectionresults)
+
+# THIS WILL RENORMALIZE THE WEIGHTS - Sums to 1 
+
+## round to improve clarity, only keep relevant columns
+sel.table<-as.data.frame(topmods)[8:12]
+
+sel.table[,2:3]<- round(sel.table[,2:3],2)
+
+sel.table[,4:5]<- round(sel.table[,4:5],3)
+
+colnames(sel.table)[1] = "K"
+
+sel.table$Model<-rownames(sel.table)
+
+# sel.table$Model[1] <- "InitialPosition"
+# sel.table$Model[2] <- "InitialPosition + ConspecificDensity"
+# sel.table$Model[3] <- "InitialPosition + DistanceMoved"
+# sel.table$Model[4] <- "InitialPosition + FishIndex"
+# sel.table$Model[5] <- "InitialPosition + FishIndex + ConspecificDensity"
+# sel.table$Model[6] <- "ConspecificDensity"
+
+sel.table$Model
+
+# rearrange to look the way I want
+sel.table<-sel.table[,c(6,1,3,4,5)]
+
+sel.table
+
+
+## summary of best models (within 2 AIC)
+summary(mod17)
+summary(mod11)
+summary(mod14)
+
+# write.csv(sel.table, "AdultDirectionality.csv")
+
+
+
+
+```
+
+```{r}
+## adult dispersers - keep only relevant columns
+disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,31,32)]
+
+```
+
+
+## Adult Propensity
+
+```{r}
+
+## all adults, looking at dispersal propensity
+adult_sub <-  adults_only[,c(4,13,26,28,29,32,33)]
+
+
+## FOR PROPENSITY, TRUEDIST IS REMOVED - Mods 2, 8 , 11, 19, 20 contain the distance moved 
+
+options(na.action = "na.fail")
+
+
+mod1 <- glm(Movement~Stream.x + InitialPosition , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+
+mod3 <- glm(Movement~Stream.x + InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod4 <- glm(Movement~Stream.x + InitialPosition + FishIndex + 
+              cdensity , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+
+
+mod6 <- glm(Movement~Stream.x + FishIndex , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod7 <- glm(Movement~ FishIndex + Mean_Wet_Width , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+
+mod9 <- glm(Movement~ cdensity , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod10 <- glm(Movement~ cdensity + Mean_Wet_Width , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+
+mod12 <- glm(Movement~ InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod13 <- glm(Movement~ InitialPosition + FishIndex + 
+              cdensity ,
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod14 <- glm(Movement~ InitialPosition +  cdensity  , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod15 <- glm(Movement~ InitialPosition + FishIndex , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod16 <- glm(Movement~ FishIndex + cdensity , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod17 <- glm(Movement~ InitialPosition , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod18 <- glm(Movement~FishIndex , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+
+
+mod21 <- glm(Movement~1, 
+            data = adult_sub, family = "binomial"(link=logit))
+
+mod22 <- glm(Movement~Stream.x + InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = adult_sub, family = "binomial"(link=logit))
+
+
+mods<- as.list(paste("mod", seq(1,22), sep=""))
+
+
+results <- model.sel(mod1,mod3,mod4,mod6,mod7,mod9,mod10,mod12,
+          mod13,mod14,mod15,mod16,mod17,mod18,mod21,mod22)
+
+sw(results)
+
+
+topmods <- subset(results, delta <2)
+
+# averages <- model.avg(topmods)
+# 
+# 
+# summary(averages)
+# confint(averages)
+
+# THIS WILL RENORMALIZE THE WEIGHTS - Sums to 1 
+
+
+sel.table<-as.data.frame(topmods)[7:11]
+
+sel.table[,2:3]<- round(sel.table[,2:3],2)
+
+sel.table[,4:5]<- round(sel.table[,4:5],3)
+
+colnames(sel.table)[1] = "K"
+# 
+sel.table$Model<-rownames(sel.table)
+
+# sel.table$Model[1] <- "NULL"
+# sel.table$Model[2] <- "ConspecificDensity"
+# sel.table$Model[3] <- "InitialPosition"
+# sel.table$Model[4] <- "FishIndex"
+
+
+sel.table$Model
+
+sel.table<-sel.table[,c(6,1,3,4,5)]
+
+sel.table
+
+# write.csv(sel.table, "AdultPropensity.csv")
+
+summary(mod21)
+summary(mod17)
+summary(mod9)
+
+
+```
+
+## Larval Direction
+
+```{r}
+
+disp_larv_only_sub <-  disp_larvae_only[,c(4,13,22,23,26,28,31,32)]
+
+options(na.action = "na.fail")
+
+
+mod1 <- glm(Distance~Stream.x + InitialPosition , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod2 <- glm(Distance~Stream.x + InitialPosition + TrueDistance , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+
+mod3 <- glm(Distance~Stream.x + InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod4 <- glm(Distance~Stream.x + InitialPosition + FishIndex + 
+              cdensity , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+
+mod5 <- glm(Distance~Stream.x + InitialPosition , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod6 <- glm(Distance~Stream.x + FishIndex , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod7 <- glm(Distance~ FishIndex + Mean_Wet_Width , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod8 <- glm(Distance~TrueDistance , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod9 <- glm(Distance~ cdensity , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod10 <- glm(Distance~ cdensity + Mean_Wet_Width , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod11 <- glm(Distance~ InitialPosition + TrueDistance , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod12 <- glm(Distance~ InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod13 <- glm(Distance~ InitialPosition + FishIndex + 
+              cdensity ,
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod14 <- glm(Distance~ InitialPosition +  cdensity  , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod15 <- glm(Distance~ InitialPosition + FishIndex , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod16 <- glm(Distance~ FishIndex + cdensity , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod17 <- glm(Distance~ InitialPosition , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod18 <- glm(Distance~FishIndex , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod19 <- glm(Distance~ TrueDistance + FishIndex , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod20 <- glm(Distance~ TrueDistance + cdensity , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod21 <- glm(Distance~1, 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+mod22 <- glm(Distance~Stream.x + InitialPosition + TrueDistance + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = disp_larv_only_sub, family = "binomial"(link=logit))
+
+
+mods<- as.list(paste("mod", seq(1,22), sep=""))
+
+
+results <- model.sel(mod1,mod2,mod3,mod4,mod6,mod7,mod8,mod9,mod10,mod11,mod12,
+          mod13,mod14,mod15,mod16,mod17,mod18,mod19,mod20,mod21,mod22)
+
+sw(results)
+
+
+topmods <- subset(results, delta <2)
+
+averages <- model.avg(topmods)
+
+
+summary(averages)
+confint(averages)
+
+# THIS WILL RENORMALIZE THE WEIGHTS - Sums to 1 
+
+
+sel.table<-as.data.frame(topmods)[8:12]
+
+sel.table[,2:3]<- round(sel.table[,2:3],2)
+
+sel.table[,4:5]<- round(sel.table[,4:5],3)
+
+colnames(sel.table)[1] = "K"
+
+sel.table$Model<-rownames(sel.table)
+
+# sel.table$Model[1] <- "DistanceMoved"
+# sel.table$Model[2] <- "InitialPosition + DistanceMoved"
+# sel.table$Model[3] <- "DistanceMoved + FishIndex"
+# sel.table$Model[4] <- "NULL"
+# sel.table$Model[5] <- "DistanceMoved + ConspecificDensity"
+# sel.table$Model[6] <- "InitialPosition"
+# sel.table$Model[7] <- "Stream + InitialPosition + DistanceMoved"
+# sel.table$Model[8] <- "FishIndex"
+# sel.table$Model[9] <- "Stream + InitialPosition"
+# 
+
+
+sel.table$Model
+
+sel.table<-sel.table[,c(6,1,3,4,5)]
+
+sel.table
+# 
+# write.csv(sel.table, "LarvaeDirectionality.csv")
+```
+
+## Larval Propensity
+
+```{r}
+
+larv_sub <-  larvae_only[,c(4,13,26,28,29,32,33)]
+
+## FOR PROPENSITY, TRUEDIST IS REMOVED - Mods 2, 8 , 11, 19, 20 
+
+options(na.action = "na.fail")
+
+
+mod1 <- glm(Movement~Stream.x + InitialPosition , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+
+mod3 <- glm(Movement~Stream.x + InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod4 <- glm(Movement~Stream.x + InitialPosition + FishIndex + 
+              cdensity , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+
+mod6 <- glm(Movement~Stream.x + FishIndex , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod7 <- glm(Movement~ FishIndex + Mean_Wet_Width , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+
+mod9 <- glm(Movement~ cdensity , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod10 <- glm(Movement~ cdensity + Mean_Wet_Width , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+
+mod12 <- glm(Movement~ InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod13 <- glm(Movement~ InitialPosition + FishIndex + 
+              cdensity ,
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod14 <- glm(Movement~ InitialPosition +  cdensity  , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod15 <- glm(Movement~ InitialPosition + FishIndex , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod16 <- glm(Movement~ FishIndex + cdensity , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod17 <- glm(Movement~ InitialPosition , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod18 <- glm(Movement~FishIndex , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+
+
+mod21 <- glm(Movement~1, 
+            data = larv_sub, family = "binomial"(link=logit))
+
+mod22 <- glm(Movement~Stream.x + InitialPosition + FishIndex + 
+              cdensity + Mean_Wet_Width , 
+            data = larv_sub, family = "binomial"(link=logit))
+
+
+mods<- as.list(paste("mod", seq(1,22), sep=""))
+
+
+results <- model.sel(mod1,mod3,mod4,mod6,mod7,mod9,mod10,mod12,
+          mod13,mod14,mod15,mod16,mod17,mod18,mod21,mod22)
+
+sw(results)
+
+topmods <- subset(results, delta <2)
+
+averages <- model.avg(topmods)
+
+
+summary(averages)
+confint(averages)
+
+# THIS WILL RENORMALIZE THE WEIGHTS - Sums to 1 
+
+
+sel.table<-as.data.frame(topmods)[7:11]
+
+sel.table[,2:3]<- round(sel.table[,2:3],2)
+
+sel.table[,4:5]<- round(sel.table[,4:5],3)
+
+colnames(sel.table)[1] = "K"
+# 
+sel.table$Model<-rownames(sel.table)
+
+# sel.table$Model[1] <- "Stream + Year + InitialPosition + FishIndex + ConspecificDensity + MeanWettedWidth"
+# sel.table$Model[2] <- "Stream + Year + InitialPosition"
+# 
+
+
+sel.table$Model
+
+sel.table<-sel.table[,c(6,1,3,4,5)]
+
+sel.table
+
+summary(mod9)
+summary(mod16)
+summary(mod10)
+summary(mod14)
+
+# write.csv(sel.table, "LarvalPropensity.csv")
+
+```
+
+## GRAPHS / FIGURES
+
+```{r}
+
+## directionality - both adults and larvae
+
+Overall_Direction <- ggplot(dispersal, aes(x=InitialPosition, y=Distance)) + geom_point() + 
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE) +
+  labs(x = "Initial Position", y = "Directionality") + ggtitle("Dispersal Directionality") + 
+  theme(text = element_text(size=20))
+Overall_Direction
+
+## adult propensity
+Adult_Prop <- ggplot(adults_only, aes(x=InitialPosition, y=Movement)) + geom_point() + 
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE) +
+  labs(x = "Initial Position", y = "Propensity") + ggtitle("Dispersal Directionality") + 
+  theme(text = element_text(size=20))
+
+## larval propensity
+Larvae_Prop <- ggplot(larvae_only, aes(x=InitialPosition, y=Movement)) + geom_point() + 
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE) +
+  labs(x = "Initial Position", y = "Propensity") + ggtitle("Dispersal Directionality") + 
+  theme(text = element_text(size=20))
+
+## adult directionality
+Adult_Dir <- ggplot(disp_adults_only, aes(x=InitialPosition, y=Distance)) + geom_point() + 
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE) +
+    labs(x = "Initial Position", y = "Directionality") + ggtitle("Dispersal Directionality") + 
+  theme(text = element_text(size=20))
+
+## larval directionality
+Larv_Dir <- ggplot(disp_larvae_only, aes(x=InitialPosition, y=Distance)) + geom_point() + 
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE) +
+    labs(x = "Initial Position", y = "Directionality") + ggtitle("Dispersal Directionality") + 
+  theme(text = element_text(size=20))
+
+```
+
+### Overlay Direction
+
+```{r}
+
+## Direction Overlay (both stages on same graph)
+## using unscaled data so that the X values are the distance from mainstem
+
+unscaled_dispersal$Stage.x <- as.factor(unscaled_dispersal$Stage.x)
+
+### does not do anything, but would remove individuals with missing stage data (which shouldnt exist at this point)
+unscaled_dispersal <- unscaled_dispersal[complete.cases(unscaled_dispersal[ , 6]),]
+
+Direction_Overlay_Figure <- ggplot(unscaled_dispersal , 
+                    aes(x=InitialPosition,y= Distance, fill =  Stage.x)) +
+  scale_fill_grey(name = "Life History Stage" , labels = c("Adults", "Larvae"), 
+                  start = 0, end = 0.7) +
+  geom_point()+
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE, color = c("gray23"))+
+  theme_bw() + 
+  labs(x = "Distance from Mainstem (m)", y= "Proportion Upstream Dispersal") +
+  theme(text = element_text(size=20))+
+  theme(axis.text=element_text(size=10),
+        axis.title=element_text(size=16))
+
+
+
+Direction_Overlay_Figure + 
+  geom_segment(
+    aes(x = -10, y = 0.15, xend = -10, yend = 0.85), # Line for "inner" section
+    arrow = arrow(type = "open", ends = "both", length = unit(0.2, "inches")),
+    color = "black",
+    size = 1.2)+
+    annotate("text", x = -10, y = 0.3, label = "Downstream", color = "black", size = 4, angle = 90) + 
+  annotate("text", x = -10, y = 0.7, label = "Upstream", color = "black", size = 4, angle = 90)+
+  theme(legend.position = c(0.8, 0.2))
+
+```
+
+```{r}
+
+
+## first block makes the graph exist, this one makes it look pretty (by moving graphics around)
+## Direction Overlay
+
+unscaled_dispersal$Stage.x <- as.factor(unscaled_dispersal$Stage.x)
+
+
+unscaled_dispersal <- unscaled_dispersal[complete.cases(unscaled_dispersal[ , 6]),]
+
+Direction_Overlay_Figure <- ggplot(unscaled_dispersal , 
+                    aes(x=InitialPosition,y= Distance, fill =  Stage.x)) +
+  scale_fill_grey(name = "Life History Stage" , labels = c("Adults", "Larvae"), 
+                  start = 0, end = 0.7) +
+  geom_point()+
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE, color = c("gray23"))+
+  theme_bw() + 
+  labs(x = "        Distance from mainstem (m)", y= "Dispersal directionality") +
+  coord_cartesian(ylim = c(0, 1), xlim = c(-80, 1500)) +
+  theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  theme(axis.text.y=element_blank(), axis.ticks.y=element_blank())+
+  theme(text = element_text(size=20))+
+    theme(axis.ticks.length=unit(.25, "cm"))+
+  theme(axis.text=element_text(size=10),
+        axis.title=element_text(size=18))+
+  theme(legend.position = c(0.8,0.8))+
+  theme(legend.key.size = unit(0.7, 'cm'), 
+        legend.key.height = unit(0.7, 'cm'), 
+        legend.key.width = unit(0.7, 'cm'), 
+        legend.title = element_text(size=12), 
+        legend.text = element_text(size=10)) + 
+  ## had to manually redraw axis labels to avoid overlapping with the arrow
+  annotate("text", x = -27, y = 0.5, label = "0.50-", color = "black", size = 3) + 
+  annotate("text", x = -27, y = 0.75, label = "0.75-", color = "black", size = 3) +
+  annotate("text", x = -27, y = 0.25, label = "0.25-", color = "black", size = 3) +
+  annotate("text", x = -27, y = 0, label = "0", color = "black", size = 3) +
+  annotate("text", x = -27, y = 1, label = "1", color = "black", size = 3) +
+  theme(plot.margin = margin(0,0,0,0))+
+  ## manually redrawing x and y axis - needed to remove it to get the arrows to look right
+  geom_segment(aes(x = 0, y = 0, xend = 1500, yend = 0))+
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = 1))
+  
+
+
+
+Direction_Overlay_Figure
+
+arrow_p <- 
+  ggplot(unscaled_dispersal) +
+  geom_segment(aes(x = -20, y = 0.40, xend = -20, yend = 0.70),
+               col = "black",
+               arrow = arrow(ends = "both")) +
+  coord_cartesian(ylim = c(0,1), xlim = c(-80,1500)) +
+  theme_void()+
+  annotate("text", x = -20, y = 0.25, label = "Downstream", 
+           color = "black", size = 4.5, angle = 90) + 
+  annotate("text", x = -20, y = 0.85, label = "Upstream", 
+           color = "black", size = 4.5, angle = 90)
+
+
+
+ ggdraw() +
+    draw_plot(Direction_Overlay_Figure) +
+    draw_plot(arrow_p)
+
+  # geom_segment(
+  #   aes(x = 1, y = -1.5, xend = 10, yend = -1.5), # Line for "inner" section
+  #   arrow = arrow(type = "closed", length = unit(0.2, "inches")),
+  #   color = "blue",
+  #   size = 1.2
+  # ) +
+  # annotate("text", x = 3, y = -2, label = "Inner", color = "blue", size = 4) + # Label for inner
+  # annotate("text", x = 8, y = -2, label = "Outer", color = "red", size = 4) +
+  # coord_cartesian(clip = "off", ylim = c(0, NA)) +
+  # theme(plot.margin = margin(5.5, 5.5, 50, 5.5))
+
+
+# Direction_Overlay_Figure
+
+```
+
+
+
+
+### Overlay Propensity
+
+```{r}
+
+## Propensity Overlay
+## exact same code with different data frame - see above for notation
+
+unscaled_my_data$Stage.x <- as.factor(unscaled_my_data$Stage.x)
+
+unscaled_my_data <- unscaled_my_data[complete.cases(unscaled_my_data[ , 6]),]
+
+
+Prop_Overlay_Figure <- ggplot(unscaled_my_data , 
+                    aes(x=InitialPosition,y= Movement, fill =  Stage.x)) +
+  scale_fill_grey(name = "Life History Stage" , labels = c("Adults", "Larvae"), 
+                  start = 0, end = 0.7) +
+  geom_point()+
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE, color = c("gray23"))+
+  theme_bw() + 
+  labs(x = "        Distance from Mainstem (m)", y= "Proportion of Dispersers")+
+  theme(text = element_text(size=20))
+
+Prop_Overlay_Figure
+
+
+# 
+# plot_grid(Prop_Overlay_Figure, Direction_Overlay_Figure,  ncol = 2,
+#           labels = c("Propensity", "Directionality" ),
+#           label_size = 12)
+```
+
+
+## Propensity Overlay
+
+```{r}
+
+unscaled_my_data$Stage.x <- as.factor(unscaled_my_data$Stage.x)
+
+
+unscaled_my_data <- unscaled_my_data[complete.cases(unscaled_my_data[ , 6]),]
+
+Prop_Overlay_Figure <- ggplot(unscaled_my_data , 
+                    aes(x=InitialPosition,y= Movement, fill =  Stage.x)) +
+  scale_fill_grey(name = "Life History Stage" , labels = c("Adults", "Larvae"), 
+                  start = 0, end = 0.7) +
+  geom_point()+
+  stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE, color = c("gray23"))+
+  theme_bw() + 
+  labs(x = "        Distance from mainstem (m)", y= "Dispersal propensity") +
+  coord_cartesian(ylim = c(0, 1), xlim = c(-80, 1500)) +
+  theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  theme(axis.text.y=element_blank(), axis.ticks.y=element_blank())+
+  theme(text = element_text(size=20))+
+  theme(axis.text=element_text(size=10),
+        axis.title=element_text(size=18))+
+  theme(axis.ticks.length=unit(.25, "cm"))+
+  theme(legend.position = c(0.8,0.8))+
+  theme(legend.key.size = unit(0.7, 'cm'), 
+        legend.key.height = unit(0.7, 'cm'), 
+        legend.key.width = unit(0.7, 'cm'), 
+        legend.title = element_text(size=12), 
+        legend.text = element_text(size=10)) + 
+  annotate("text", x = -27, y = 0.5, label = "0.50-", color = "black", size = 3) +
+  annotate("text", x = -27, y = 0.75, label = "0.75-", color = "black", size = 3) +
+  annotate("text", x = -27, y = 0.25, label = "0.25-", color = "black", size = 3) +
+  annotate("text", x = -27, y = 0, label = "0", color = "black", size = 3) +
+  annotate("text", x = -27, y = 1, label = "1", color = "black", size = 3) +
+  theme(plot.margin = margin(0,0,0,0))+
+  geom_segment(aes(x = 0, y = 0, xend = 1500, yend = 0))+
+  geom_segment(aes(x = 0, y = 0, xend = 0, yend = 1))
+  
+
+
+
+Prop_Overlay_Figure 
+
+arrow_p_prop <- 
+  ggplot(unscaled_my_data) +
+  geom_segment(aes(x = -20, y = 0.4, xend = -20, yend = 0.75),
+               col = "black",
+               arrow = arrow(ends = "both")) +
+  coord_cartesian(ylim = c(0,1), xlim = c(-80,1500)) +
+  theme_void()+
+  annotate("text", x = -20, y = 0.25, label = "Non-Disperser", 
+           color = "black", size = 4.5, angle = 90) + 
+  annotate("text", x = -20, y = 0.85, label = "Disperser", 
+           color = "black", size = 4.5, angle = 90)
+
+
+
+ ggdraw() +
+    draw_plot(Prop_Overlay_Figure) +
+    draw_plot(arrow_p_prop)
+
+  # geom_segment(
+  #   aes(x = 1, y = -1.5, xend = 10, yend = -1.5), # Line for "inner" section
+  #   arrow = arrow(type = "closed", length = unit(0.2, "inches")),
+  #   color = "blue",
+  #   size = 1.2
+  # ) +
+  # annotate("text", x = 3, y = -2, label = "Inner", color = "blue", size = 4) + # Label for inner
+  # annotate("text", x = 8, y = -2, label = "Outer", color = "red", size = 4) +
+  # coord_cartesian(clip = "off", ylim = c(0, NA)) +
+  # theme(plot.margin = margin(5.5, 5.5, 50, 5.5))
+
+
+# Direction_Overlay_Figure
+```
+
+
+
+
+
+## Fish Hists
+
+```{r}
+
+# zigzag
+zfish <- ggplot(ZigFish, aes(x=Position)) + 
+  geom_histogram(fill = "grey50", color = "black", binwidth = 25, position = "dodge") +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(-15,1500)+
+  ylim(0,20)+
+  theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+
+# bear
+bfish <- ggplot(BearFish, aes(x=Position)) + 
+  geom_histogram(fill = "grey50", color = "black", binwidth = 25, position = "dodge") +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(-15,1500)+
+  ylim(0,20)+
+  theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+
+# paradise
+pfish <- ggplot(ParFish, aes(x=Position)) + 
+  geom_histogram(fill = "grey50", color = "black", binwidth = 25, position = "dodge") +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(-15,1500)+
+  ylim(0,20)+
+  theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+# gridExtra::grid.arrange(zfish, bfish, pfish, ncol = 1, nrow = 3)
+
+plotfish <- plot_grid(zfish, bfish, pfish, ncol = 1,
+          labels = c("  Zigzag", "   Bear", "Paradise"),
+          label_size = 12)
+
+y.grob <- textGrob("Brook trout captured", 
+                   gp=gpar(col="black", fontsize=18), rot=90)
+
+x.grob <- textGrob("Distance from mainstem (m)", 
+                   gp=gpar(col="black", fontsize=18))
+
+grid.arrange(arrangeGrob(plotfish, left = y.grob, bottom = x.grob))
+
+```
+
+## Salamander Histograms
+
+```{r}
+## debugging script - works now
+
+zsal <- ggplot(abundance, aes(x=IP, y = True_Estimate_Zig)) + 
+  geom_bar(stat = "identity", color = "black") +
+  theme(text = element_text(size=15))+
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+    theme(axis.title.y=element_blank())+
+  xlim(0,1501)
+
+zsal
+
+
+```
+
+
+```{r}
+## keep relevant columns
+
+parAB <- abundance[,c(1,3,6,11,12,13)]
+bearAB <- abundance[,c(1,2,5,8,9,10)]
+zigAB <- abundance[,c(1,4,7,14,15,16)]
+
+ziglower <- subset(zigAB, zigAB$IP <= 500)
+parlower <- subset(parAB, parAB$IP <= 500)
+bearlower <- subset(bearAB, bearAB$IP <= 500)
+
+zigupper <- subset(zigAB, zigAB$IP >= 1000)
+parupper <- subset(parAB, parAB$IP >= 750 & parAB$IP < 1250 )
+bearupper <- subset(bearAB, bearAB$IP >= 900 & bearAB$IP < 1400)
+
+
+## plotting the upper and lower sections separately to keep spacing consistent
+## then stacking them on top of each other with identical axis limits
+
+zsal_low <- ggplot(ziglower, aes(x=IP, y = True_Estimate_Zig)) + 
+  geom_bar(stat = "identity", fill = "grey50", width = 20) +
+  geom_errorbar(aes(ymin=LE_Zig, ymax=UE_Zig), width=.2,
+                 position=position_dodge(.9)) +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(-15,500)+
+  ylim(0,85)+
+  theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+
+zsal_high <- ggplot(zigupper, aes(x=IP, y = True_Estimate_Zig)) + 
+  geom_bar(stat = "identity", fill = "grey50",width = 20) +
+  geom_errorbar(aes(ymin=LE_Zig, ymax=UE_Zig), width=.2,
+                 position=position_dodge(.9)) +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(950,1500)+
+  ylim(0,85)+
+   theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(plot.background=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+
+
+bsal_low <- ggplot(bearlower, aes(x=IP, y = True_Estimate_Bear)) + 
+  geom_bar(stat = "identity", fill = "grey50",width = 20) +
+  geom_errorbar(aes(ymin=LE_Bear, ymax=UE_Bear), width=.2,
+                 position=position_dodge(.9)) +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(-15,500)+
+  ylim(0,85)+
+  theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(plot.background=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+
+bsal_high <- ggplot(bearupper, aes(x=IP, y = True_Estimate_Bear)) + 
+  geom_bar(stat = "identity", fill = "grey50",width = 20) +
+  geom_errorbar(aes(ymin=LE_Bear, ymax=UE_Bear), width=.2,
+                 position=position_dodge(.9)) +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(875,1400)+
+  ylim(0,85)+
+  theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(plot.background=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+
+
+psal_low <- ggplot(parlower, aes(x=IP, y = True_Estimate_Para)) + 
+  geom_bar(stat = "identity", fill = "grey50",width = 20) +
+  geom_errorbar(aes(ymin=LE_Para, ymax=UE_Para, x = IP), width=.2) +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(-15,500)+
+  ylim(0,85)+
+   theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(plot.background=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+  labs(x = "Distance From Mainstem (m)")
+
+psal_high <- ggplot(parupper, aes(x=IP, y = True_Estimate_Para)) + 
+  geom_bar(stat = "identity", fill = "grey50",width = 20) +
+  geom_errorbar(aes(ymin=LE_Para, ymax=UE_Para, x = IP), width=.2) +
+  theme_bw()+
+  theme(text = element_text(size=15))+
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  xlim(700,1250)+
+  ylim(0,85)+
+   theme(axis.title.x=element_blank())+
+  theme(axis.title.y=element_blank())+
+  theme(plot.background=element_blank())+
+  theme(axis.line = element_line(color = 'black'))
+  labs(x = "Distance From Mainstem (m)")
+
+  
+
+### the labels were off center, added random spaces to make them line up
+plot <- plot_grid(zsal_low, zsal_high, bsal_low, bsal_high, psal_low, psal_high,  ncol = 2,
+          labels = c("    Zigzag","", "     Bear",  "",  "   Paradise", ""),
+          label_size = 10)
+
+
+#create common x and y labels
+
+y.grob <- textGrob("Estimated abundance", 
+                   gp=gpar(col="black", fontsize=18), rot=90)
+
+x.grob <- textGrob("Distance from mainstem (m)", 
+                   gp=gpar(col="black", fontsize=18))
+
+#add to plot
+
+grid.arrange(arrangeGrob(plot, left = y.grob, bottom = x.grob))
+
+```
+
+
+
+
+
+```{r}
+
+## distance graph - bars are 8m wide so that all non dispersers (4m or less of disp distance) are in the same bar
+
+disp_copy <- subset(my_data22, abs(my_data22$neg_dist) > 4)
+md22_no_out <- subset(my_data22, abs(my_data22$neg_dist) < 100)   ## removes outliers for zooming in 
+md22_no_out_disp <- subset(disp_copy, abs(disp_copy$neg_dist) < 100)
+
+
+TrueDistGraph <- ggplot(my_data22, aes(x=neg_dist)) + 
+  geom_histogram(fill = "grey50", color = "black", binwidth = 8) +
+  coord_cartesian(clip = 'off') +
+  labs(x = "Distance moved(m)", y = "         Number of individuals")+
+  theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(), axis.line = element_blank())+
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())
+
+  
+  
+
+
+# line break present due to large number of non-dispersers
+TrueDistGraph3 <- TrueDistGraph + 
+  scale_y_break(c(200,1150), space = 0.5, scales = 0.20, ticklabels = c(1150,1250)) +
+  theme(axis.text=element_text(size=10),
+        axis.title=element_text(size=16))
+
+
+  # annotate("text", x = -750, y = -50, label = "Downstream", color = "black", size = 6) + 
+  # annotate("text", x = 750, y = -50, label = "Upstream", color = "black", size = 6)+
+
+
+# TrueDistGraph2
+TrueDistGraph3 
+
+TrueDistGraph3 + 
+  geom_segment(
+    aes(x = 100, y = -25, xend = 650, yend = -25), # Line for "inner" section
+    arrow = arrow(type = "open"),
+    color = "black",
+    size = 0.3) + 
+  geom_segment(
+    aes(x = -100, y = -25, xend = -650, yend = -25), # Line for "inner" section
+    arrow = arrow(type = "open"),
+    color = "black",
+    size = 0.3)+
+  coord_cartesian(clip = 'off')+
+  geom_hline(yintercept = 0)+
+  geom_segment(x = -1200, y = 0, xend = -1200, yend = 1000)+
+  annotate("text", x = -850, y = -25, label = "Downstream", color = "black", size = 4) +
+  annotate("text", x = 850, y = -25, label = "Upstream", color = "black", size = 4) +
+  annotate("text", x = -1000, y = -3, label = "|\n-1000", color = "black", size = 3) +
+  annotate("text", x = -750, y = -3, label = "|\n-750", color = "black", size = 3) +
+  annotate("text", x = -500, y = -3, label = "|\n-500", color = "black", size = 3) +
+  annotate("text", x = -250, y = -3, label = "|\n-250", color = "black", size = 3) +
+  annotate("text", x = 0, y = -3, label = "|\n0", color = "black", size = 3) +
+  annotate("text", x = 250, y = -3, label = "|\n250", color = "black", size = 3) +
+  annotate("text", x = 500, y = -3, label = "|\n500", color = "black", size = 3) +
+  annotate("text", x = 750, y = -3, label = "|\n750", color = "black", size = 3) +
+  annotate("text", x = 1000, y = -3, label = "|\n1000", color = "black", size = 3) +
+  
+  # just like before, had to manually redraw axis + labels to accomodate the arrows (the the line break)
+  
+  theme(plot.margin = margin(0,0,0,0))
+
+   
+
+
+
+```
+
+```{r}
+## checking for corr between explanatory variables
+## detected between min and wetted width - went with mean to better represent average water avail rather than one bad day 
+
+correlation <- cor(my_data$Mean_Wet_Width, my_data$InitialPosition, method = 'pearson')
+
+correlation
+
+
+correlation <- cor(my_data$Mean_Wet_Width, my_data$cdensity, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$Mean_Wet_Width, my_data$FishIndex, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$Mean_Wet_Width, my_data$TrueDistance, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$Mean_Wet_Width, my_data$Mean_Wet_Width, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$InitialPosition, my_data$cdensity, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$InitialPosition, my_data$FishIndex, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$InitialPosition, my_data$TrueDistance, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$cdensity, my_data$FishIndex, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$cdensity, my_data$TrueDistance, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$FishIndex, my_data$TrueDistance, method = 'pearson')
+
+correlation
+
+correlation <- cor(my_data$Mean_Wet_Width, my_data$Min_Wet_Width, method = 'pearson')
+
+correlation
+
+## a few random analyses thrown here that I did while writing the paper
+## t-test between directionality and distance moved - do we see them moving further up or down? 
+upstream <- subset(unscaled_dispersal, unscaled_dispersal$Distance == 1)
+downstream <- subset(unscaled_dispersal, unscaled_dispersal$Distance == 0)
+
+t.test(upstream$TrueDistance, downstream$TrueDistance)
+
+## chi square for dispersal direction - are they more likely to move one direction? 
+obs <- c(DS = length(downstream$FinalID), US = length(upstream$FinalID))
+
+
+# Hypothesized proportions (equal proportions)
+expec <- c(0.5,0.5)
+
+xsq <- chisq.test(x = obs, p = expec)
+
+
+print(xsq)
+
+## outlier dispersal distance (200m chosen because of the inbreeding paper cited)
+bigdist <- subset(unscaled_dispersal, unscaled_dispersal$TrueDistance > 200)
+
+## proportion of dispersers in each stream
+a <- length(unique(my_data$FinalID[my_data$Stream.x == "Paradise"]))
+b <- length(unique(dispersal$FinalID[dispersal$Stream.x == "Paradise"]))
+b/a
+print(c(a,b))
+
+a <- length(unique(my_data$FinalID[my_data$Stream.x == "Bear"]))
+b <- length(unique(dispersal$FinalID[dispersal$Stream.x == "Bear"]))
+b/a
+print(c(a,b))
+
+a <- length(unique(my_data$FinalID[my_data$Stream.x == "Zigzag"]))
+b <- length(unique(dispersal$FinalID[dispersal$Stream.x == "Zigzag"]))
+b/a
+print(c(a,b))
+
+
+library(moments)
+## skew of the direction data (highly right skewed - more likely to move DS)
+## might be better than Xsq? will have to go back to lit
+
+skewness(unscaled_my_data$TrueDistance)
+
+agostino.test(unscaled_my_data$TrueDistance)
+```
+
