@@ -7,6 +7,9 @@
 
 R_Mark_Abundance.R - Code to recreate the abundance analyses. The default is for Paradise Brook, but changing the stream name on the filter (Line 15) to either "Bear" or "Zigzag" will produce the other estimates
 
+R_Mark_Edge_Surv = exact same code as the abundance anaylses (see the notation in R_Mark_Abundance.R for explanations) but with an extra line filtering data to only look at individuals at the edges (upper and lower 10% of each stream) 
+R_Mark_Surv_Non.R = Includes every individual EXCEPT the ones at the edges
+
 HBFish_Data_Combined.csv - the data for all the brook trout captured from 2022-2025. 
 
 Publication_Code.RMD - R markdown document containing all the publication code (outside of the abundance model) and the figures used in the paper 
