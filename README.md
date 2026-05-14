@@ -5,9 +5,7 @@
 
 2025_Capture_History.csv - earlier version of the dataset, not used in this paper
 
-Abundance_JS_Bear.R - The code for the Open Population Jolly Seber Model used in the analyses
-  _Excluding_Telemetry - same model, but for paradise brook
-  _Zigzag.R - same model, but for Zigzag Brook
+R_Mark_Abundance.R - Code to recreate the abundance analyses. The default is for Paradise Brook, but changing the stream name on the filter (Line 15) to either "Bear" or "Zigzag" will produce the other estimates
 
 HBFish_Data_Combined.csv - the data for all the brook trout captured from 2022-2025. 
 
