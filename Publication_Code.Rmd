@@ -46,7 +46,7 @@ setDT(original)
 colnames(original)[colnames(original) == "ï..FinalID"] <- "FinalID" # not needed anymore, but keeping for future use just in case
 head(original)
 
-abundance <- read.csv("Relative_Abundances_2025.csv") # from the bayesian model - code and results can be found in same repository ADD NAME WHEN PUBLISHED
+abundance <- read.csv("Relative_Abundances_RMark.csv") # from the bayesian model - code and results can be found in same repository ADD NAME WHEN PUBLISHED
 
 original <- original %>%
   filter(Stream == "Bear"|Stream == "Paradise"|Stream == "Zigzag") #removing cascade + canyon (dropped from study after 3 years)
@@ -481,44 +481,7 @@ for(i in 1:length(my_data$FinalID)){
 }
 
 
-## Lower Bound CD estimate
 
-my_data$lowercdensity <- NA
-
-for(i in 1:length(my_data$FinalID)){
-  for(j in 1:length(abundance$IP)){
-    
-    if(my_data$Stream.x[i] == "Paradise" & my_data$IPBin[i] == abundance$IP[j]){
-      my_data$lowercdensity[i] <- abundance$LE_Para[j]
-    }
-    else if(my_data$Stream.x[i] == "Bear" & my_data$IPBin[i] == abundance$IP[j]){
-      my_data$lowercdensity[i] <- abundance$LE_Bear[j]
-    }
-    else if(my_data$Stream.x[i] == "Zigzag" & my_data$IPBin[i] == abundance$IP[j]){
-      my_data$lowercdensity[i] <- abundance$LE_Zig[j]
-    }
-}
-}
-
-
-## UPPER BOUND CD estimate
-
-my_data$uppercdensity <- NA
-
-for(i in 1:length(my_data$FinalID)){
-  for(j in 1:length(abundance$IP)){
-    
-    if(my_data$Stream.x[i] == "Paradise" & my_data$IPBin[i] == abundance$IP[j]){
-      my_data$uppercdensity[i] <- abundance$UE_Para[j]
-    }
-    else if(my_data$Stream.x[i] == "Bear" & my_data$IPBin[i] == abundance$IP[j]){
-      my_data$uppercdensity[i] <- abundance$UE_Bear[j]
-    }
-    else if(my_data$Stream.x[i] == "Zigzag" & my_data$IPBin[i] == abundance$IP[j]){
-      my_data$uppercdensity[i] <- abundance$UE_Zig[j]
-    }
-}
-}
 ```
 
 ```{r}
@@ -824,7 +787,7 @@ disp_larvae_only$FishIndex <- scale(disp_larvae_only$FishIndex)
 
 
 ## keep only relevant columns
-disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,31,32)]
+disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,29)]
 
 options(na.action = "na.fail")
 
@@ -906,7 +869,7 @@ mods<- as.list(paste("mod", seq(1,22), sep=""))
 ## manually pasted all the models. Because c(mods) did not work and this is quicker than trying to figure out why
 results <- model.sel(mod1,mod2,mod3,mod4,mod6,mod7,mod8,mod9,mod10,mod11,mod12,
           mod13,mod14,mod15,mod16,mod17,mod18,mod19,mod20,mod21,mod22)
-
+results
 
 sw(results)
 
@@ -959,14 +922,14 @@ summary(mod14)
 
 # write.csv(sel.table, "AdultDirectionality.csv")
 
-
-
+predict(mod17, data.frame(InitialPosition = min(disp_adults_only$InitialPosition)), type = "response")
+predict(mod17, data.frame(InitialPosition = max(disp_adults_only$InitialPosition)), type = "response")
 
 ```
 
 ```{r}
 ## adult dispersers - keep only relevant columns
-disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,31,32)]
+disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,29)]
 
 ```
 
@@ -976,7 +939,7 @@ disp_adults_only_sub <-  disp_adults_only[,c(4,13,22,23,26,28,31,32)]
 ```{r}
 
 ## all adults, looking at dispersal propensity
-adult_sub <-  adults_only[,c(4,13,26,28,29,32,33)]
+adult_sub <-  adults_only[,c(4,13,26,28,29,30,31)]
 
 
 ## FOR PROPENSITY, TRUEDIST IS REMOVED - Mods 2, 8 , 11, 19, 20 contain the distance moved 
@@ -1053,6 +1016,7 @@ results <- model.sel(mod1,mod3,mod4,mod6,mod7,mod9,mod10,mod12,
 
 sw(results)
 
+results
 
 topmods <- subset(results, delta <2)
 
@@ -1100,7 +1064,7 @@ summary(mod9)
 
 ```{r}
 
-disp_larv_only_sub <-  disp_larvae_only[,c(4,13,22,23,26,28,31,32)]
+disp_larv_only_sub <-  disp_larvae_only[,c(4,13,22,23,26,28,29)]
 
 options(na.action = "na.fail")
 
@@ -1234,7 +1198,7 @@ sel.table
 
 ```{r}
 
-larv_sub <-  larvae_only[,c(4,13,26,28,29,32,33)]
+larv_sub <-  larvae_only[,c(4,13,26,28,29,30,31)]
 
 ## FOR PROPENSITY, TRUEDIST IS REMOVED - Mods 2, 8 , 11, 19, 20 
 
@@ -1439,9 +1403,8 @@ unscaled_dispersal <- unscaled_dispersal[complete.cases(unscaled_dispersal[ , 6]
 
 Direction_Overlay_Figure <- ggplot(unscaled_dispersal , 
                     aes(x=InitialPosition,y= Distance, fill =  Stage.x)) +
-  scale_fill_grey(name = "Life History Stage" , labels = c("Adults", "Larvae"), 
-                  start = 0, end = 0.7) +
-  geom_point()+
+  scale_fill_discrete(name = "Life History Stage", labels = c("Adults", "Larvae")) +
+  geom_jitter(height = 0.02, aes(colour = Stage.x), show.legend = FALSE)+
   stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE, color = c("gray23"))+
   theme_bw() + 
   labs(x = "        Distance from mainstem (m)", y= "Dispersal directionality") +
@@ -1555,9 +1518,8 @@ unscaled_my_data <- unscaled_my_data[complete.cases(unscaled_my_data[ , 6]),]
 
 Prop_Overlay_Figure <- ggplot(unscaled_my_data , 
                     aes(x=InitialPosition,y= Movement, fill =  Stage.x)) +
-  scale_fill_grey(name = "Life History Stage" , labels = c("Adults", "Larvae"), 
-                  start = 0, end = 0.7) +
-  geom_point()+
+  scale_fill_discrete(name = "Life History Stage", labels = c("Adults", "Larvae")) +
+  geom_jitter(height = 0.025, aes(colour = Stage.x), show.legend = FALSE)+
   stat_smooth(method="glm", method.args=list(family="binomial"), se=TRUE, color = c("gray23"))+
   theme_bw() + 
   labs(x = "        Distance from mainstem (m)", y= "Dispersal propensity") +
@@ -1707,9 +1669,9 @@ zsal
 ```{r}
 ## keep relevant columns
 
-parAB <- abundance[,c(1,3,6,11,12,13)]
-bearAB <- abundance[,c(1,2,5,8,9,10)]
-zigAB <- abundance[,c(1,4,7,14,15,16)]
+parAB <- abundance[,c(1,3,6,9)]
+bearAB <- abundance[,c(1,2,5,8)]
+zigAB <- abundance[,c(1,4,7,10)]
 
 ziglower <- subset(zigAB, zigAB$IP <= 500)
 parlower <- subset(parAB, parAB$IP <= 500)
@@ -1725,8 +1687,6 @@ bearupper <- subset(bearAB, bearAB$IP >= 900 & bearAB$IP < 1400)
 
 zsal_low <- ggplot(ziglower, aes(x=IP, y = True_Estimate_Zig)) + 
   geom_bar(stat = "identity", fill = "grey50", width = 20) +
-  geom_errorbar(aes(ymin=LE_Zig, ymax=UE_Zig), width=.2,
-                 position=position_dodge(.9)) +
   theme_bw()+
   theme(text = element_text(size=15))+
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
@@ -1739,8 +1699,6 @@ zsal_low <- ggplot(ziglower, aes(x=IP, y = True_Estimate_Zig)) +
 
 zsal_high <- ggplot(zigupper, aes(x=IP, y = True_Estimate_Zig)) + 
   geom_bar(stat = "identity", fill = "grey50",width = 20) +
-  geom_errorbar(aes(ymin=LE_Zig, ymax=UE_Zig), width=.2,
-                 position=position_dodge(.9)) +
   theme_bw()+
   theme(text = element_text(size=15))+
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
@@ -1755,8 +1713,6 @@ zsal_high <- ggplot(zigupper, aes(x=IP, y = True_Estimate_Zig)) +
 
 bsal_low <- ggplot(bearlower, aes(x=IP, y = True_Estimate_Bear)) + 
   geom_bar(stat = "identity", fill = "grey50",width = 20) +
-  geom_errorbar(aes(ymin=LE_Bear, ymax=UE_Bear), width=.2,
-                 position=position_dodge(.9)) +
   theme_bw()+
   theme(text = element_text(size=15))+
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
@@ -1770,8 +1726,6 @@ bsal_low <- ggplot(bearlower, aes(x=IP, y = True_Estimate_Bear)) +
 
 bsal_high <- ggplot(bearupper, aes(x=IP, y = True_Estimate_Bear)) + 
   geom_bar(stat = "identity", fill = "grey50",width = 20) +
-  geom_errorbar(aes(ymin=LE_Bear, ymax=UE_Bear), width=.2,
-                 position=position_dodge(.9)) +
   theme_bw()+
   theme(text = element_text(size=15))+
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
@@ -1786,7 +1740,6 @@ bsal_high <- ggplot(bearupper, aes(x=IP, y = True_Estimate_Bear)) +
 
 psal_low <- ggplot(parlower, aes(x=IP, y = True_Estimate_Para)) + 
   geom_bar(stat = "identity", fill = "grey50",width = 20) +
-  geom_errorbar(aes(ymin=LE_Para, ymax=UE_Para, x = IP), width=.2) +
   theme_bw()+
   theme(text = element_text(size=15))+
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
@@ -1801,7 +1754,6 @@ psal_low <- ggplot(parlower, aes(x=IP, y = True_Estimate_Para)) +
 
 psal_high <- ggplot(parupper, aes(x=IP, y = True_Estimate_Para)) + 
   geom_bar(stat = "identity", fill = "grey50",width = 20) +
-  geom_errorbar(aes(ymin=LE_Para, ymax=UE_Para, x = IP), width=.2) +
   theme_bw()+
   theme(text = element_text(size=15))+
   theme(panel.border = element_blank(), panel.grid.major = element_blank(),
@@ -1900,6 +1852,7 @@ TrueDistGraph3 +
   annotate("text", x = 500, y = -3, label = "|\n500", color = "black", size = 3) +
   annotate("text", x = 750, y = -3, label = "|\n750", color = "black", size = 3) +
   annotate("text", x = 1000, y = -3, label = "|\n1000", color = "black", size = 3) +
+  geom_segment(aes(x = -1000, y = 0, xend = -1000, yend = 1250))+
   
   # just like before, had to manually redraw axis + labels to accomodate the arrows (the the line break)
   
@@ -2010,5 +1963,158 @@ library(moments)
 skewness(unscaled_my_data$TrueDistance)
 
 agostino.test(unscaled_my_data$TrueDistance)
+```
+
+
+```{r}
+
+
+disp_testing <- unscaled_dispersal
+disp_testing$finalfish <- NA
+
+
+
+XCheck <- 12.5      ## uses the bin loops to assign fish index scores to individual salamanders - how many fish were detected in the closest minnow trap? 
+YCheck <- 1
+
+repeat{
+
+for(i in 1:length(disp_testing$FinalPosition)){
+  if(disp_testing$FinalPosition[i] <= XCheck & is.na(disp_testing$finalfish[i]) & disp_testing$Stream.y[i] == "Bear"){
+    disp_testing$finalfish[i] <- BearFishLevel[YCheck]
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+XCheck <- -12.5
+YCheck <- 1
+
+repeat{
+
+for(i in 1:length(disp_testing$FinalPosition)){
+  if(disp_testing$FinalPosition[i] <= XCheck & is.na(disp_testing$finalfish[i]) & disp_testing$Stream.y[i] == "Paradise"){
+    disp_testing$finalfish[i] <- ParFishLevel[YCheck]
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+XCheck <- -12.5
+YCheck <- 1
+
+repeat{
+
+for(i in 1:length(disp_testing$FinalPosition)){
+  if(disp_testing$FinalPosition[i] <= XCheck & is.na(disp_testing$finalfish[i]) & disp_testing$Stream.y[i] == "Zigzag"){
+    disp_testing$finalfish[i] <- ZigFishLevel[YCheck]
+  }
+}
+
+XCheck <- XCheck + 25
+YCheck <- YCheck + 1
+
+if(XCheck > 1600){
+  break
+}
+}
+
+disp_testing$finalfish <- disp_testing$finalfish/25
+
+disp_testing <- subset(disp_testing, disp_testing$IPBin != disp_testing$FPBin)
+
+disp_testing <- subset(disp_testing, disp_testing$FishIndex > 0 | disp_testing$finalfish > 0 )
+
+t.test(disp_testing$FishIndex, disp_testing$finalfish, paired = TRUE)
+
+
+```
+
+
+
+```{r}
+
+disp_testing <- unscaled_dispersal
+
+disp_testing$final_ten <- round(disp_testing$FinalPosition/10)*10   ## assign salamanders to the nearest measurement site (eg - closest measurement for all individuals between 35 and 44 meters was at 40m - rounded up )
+disp_testing$finalwet <- NA
+disp_testing$finalminwet <- NA
+
+
+for(i in 1:length(disp_testing$final_ten)){     ### if the stream and capture position match, assign mean and min wetted width values 
+  for(j in 1:length(water2$Corr_Pos)){
+    if(disp_testing$final_ten[i] == water2$Corr_Pos[j] & disp_testing$Stream.x[i] == water2$Stream[j]){
+      disp_testing$finalwet[i] <- water2$Mean_Wet_Width[j]
+      disp_testing$finalminwet[i] <- water2$Min_Wet_Width[j]
+    }
+  }
+}
+
+disp_testing <- subset(disp_testing, disp_testing$ten_rounded != disp_testing$final_ten)
+
+t.test(disp_testing$Min_Wet_Width, disp_testing$finalminwet, paired = TRUE)
+```
+
+
+```{r}
+
+# breaks <- seq(0,1400,25)
+# hist(unscaled_my_data$InitialPosition[unscaled_my_data$Stream.x == "Bear"], 
+#      breaks = breaks)
+# 
+# breaks <- seq(0,1500,25)
+# hist(unscaled_my_data$InitialPosition[unscaled_my_data$Stream.x == "Zigzag"], 
+#      breaks = breaks)
+# 
+# breaks <- seq(0,1250,25)
+# hist(unscaled_my_data$InitialPosition[unscaled_my_data$Stream.x == "Paradise"], 
+#      breaks = breaks)
+
+
+unscaled_my_data$edges <- 0
+for(i in 1:nrow(unscaled_my_data)){
+  if(unscaled_my_data$Stream.x[i] == "Paradise" & (unscaled_my_data$InitialPosition[i] <= 100 | unscaled_my_data$InitialPosition[i] >= 1150)){
+    unscaled_my_data$edges[i] <- 1 
+  }
+  else if (unscaled_my_data$Stream.x[i] == "Bear" & (unscaled_my_data$InitialPosition[i] <= 100 | unscaled_my_data$InitialPosition[i] >= 1300)){
+    unscaled_my_data$edges[i] <- 1 
+  }
+  else if (unscaled_my_data$Stream.x[i] == "Zigzag" & (unscaled_my_data$InitialPosition[i] <= 100 | unscaled_my_data$InitialPosition[i] >= 1400)){
+    unscaled_my_data$edges[i] <- 1 
+  }
+}
+
+edges <- subset(unscaled_my_data, unscaled_my_data$edges > 0) 
+non <- subset(unscaled_my_data, unscaled_my_data$edges == 0) 
+
+t.test(edges$cdensity, non$cdensity)
+
+```
+
+```{r}
+# do adults move further than larv?
+t.test(unscaled_adults_only_disp$TrueDistance, unscaled_larv_only_disp$TrueDistance)
+boxplot(unscaled_adults_only_disp$TrueDistance, unscaled_larv_only_disp$TrueDistance, ylim = c(0,100))
+
+wilcox.test(unscaled_adults_only_disp$TrueDistance[unscaled_adults_only_disp$Distance == 1], unscaled_larv_only_disp$TrueDistance[unscaled_larv_only_disp$Distance == 1])
+median(unscaled_adults_only_disp$TrueDistance[unscaled_adults_only_disp$Distance == 1])
+median(unscaled_larv_only_disp$TrueDistance[unscaled_larv_only_disp$Distance == 1])
+
+wilcox.test(unscaled_adults_only_disp$TrueDistance[unscaled_adults_only_disp$Distance == 0], unscaled_larv_only_disp$TrueDistance[unscaled_larv_only_disp$Distance == 0])
+median(unscaled_adults_only_disp$TrueDistance[unscaled_adults_only_disp$Distance == 0])
+median(unscaled_larv_only_disp$TrueDistance[unscaled_larv_only_disp$Distance == 0])
+
 ```
 
